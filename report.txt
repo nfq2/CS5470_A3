@@ -1,0 +1,43 @@
+CS5470 HW3: Strided Attention CUDA Kernel
+
+The kernel assigns one block of 256 threads to each (batch, head, query)
+combination, allowing queries to run independently (cuda/strided_attention_student.cu,
+lines 26-32 and 122-127). It loads the query into shared memory once for reuse
+across keys (lines 21-37), then computes scores only for keys at positions
+0, stride, 2*stride, and so on (lines 39-53). The eight warps divide these keys
+among themselves; lanes read adjacent head dimensions and combine partial dot
+products using warp shuffle reductions. This provides coalesced key reads and
+avoids computing scores that the naive implementation later masks out. Shared
+memory holds scores and reduction scratch space for a stable softmax, which
+subtracts the maximum score and adds the reference's 1e-6 to the denominator
+(lines 55-81). Each active output thread then sums over the selected values for
+one head dimension, so neighboring threads read neighboring value elements
+(lines 83-90). Fusing these operations into one kernel avoids allocating full
+sequence-by-sequence score, mask, and weight tensors and reduces the many
+separate GPU operations used by the naive Python loops over batches and heads.
+
+The accumulator type preserves double precision for float64 inputs and uses
+float accumulation for float16 inputs (line 21). The key count uses ceiling
+division, so nondivisible sequence lengths and strides larger than the sequence
+are handled correctly (line 29). Inactive reduction threads contribute negative
+infinity to the maximum and zero to the sum. Shared arrays support the assignment's
+limits of head_dim <= 256 and ceil(seq_len/stride) <= 256. The wrapper validates
+inputs and launches on PyTorch's current CUDA stream with the input device guarded
+(lines 94-129). CustomStridedAttention.forward passes contiguous Q, K, and V to the
+kernel before merging heads and applying the output projection
+(attention_student.py, lines 75-89).
+
+Validation on Perlmutter passed all four provided float64 correctness cases and
+three additional cases covering a single-element input, head_dim=33 with stride=1,
+and head_dim=256 with 256 attended keys. All seven also passed attention-layer
+integration checks, including reshaping and output projection. Comparisons used
+rtol=1e-5 and atol=1e-6. The float32 benchmark correctness check also passed with
+rtol=1e-3 and atol=1e-4. Hidden grading cases have not been run.
+
+The provided benchmark used batch_size=16, seq_len=1024, embed_dim=512,
+num_heads=8, head_dim=64, and stride=4, with 10 warmup iterations and 100 timed
+iterations per implementation. The measured average times were 28.2372 ms for
+naive PyTorch and 7.3783 ms for the custom CUDA implementation, giving a reported
+3.83x speedup, above the assignment's 1.8x target. These measurements time the
+attention operation on precomputed contiguous Q, K, and V; they exclude projection
+layers, contiguous-copy preparation, and initial extension compilation.
