@@ -78,11 +78,10 @@ class CustomStridedAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4) # (3, batch_size, num_heads, seq_len, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # TODO: Replace the call to the naive implementation below with a call
-        # to your custom CUDA kernel `strided_attention_forward`.
- 
-        # Using the naive implementation as a placeholder.
-        output = naive_strided_attention(q, k, v, self.stride)
+        # The permuted projections are views; the kernel expects dense tensors.
+        output = strided_attention_forward(
+            q.contiguous(), k.contiguous(), v.contiguous(), self.stride
+        )
 
         # Reshape and project the output back to the original shape
         output = output.permute(0, 2, 1, 3).contiguous()

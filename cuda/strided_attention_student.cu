@@ -1,134 +1,135 @@
 #include <torch/extension.h>
-#include <cuda_fp16.h>
-#include <stdexcept>
-#include <vector>
-
+#include <ATen/AccumulateType.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 
-// CUDA kernel for the forward pass of strided attention
-//
-// T: data type (e.g., float, double, half)
-//
-// Computes: output = Softmax((Q * K_strided^T) / sqrt(head_dim)) * V_strided
-//
-// Grid/Block Dimensions:
-// - gridDim.x: batch_size * num_heads
-// - gridDim.y: seq_len (for queries)
-// - blockDim.x: 256. Represents threads per query token.
-//
+// One 256-thread block per query. Each warp computes one strided key's
+// score at a time; adjacent lanes read adjacent head dimensions.
 template <typename T>
 __global__ void strided_attention_forward_kernel(
     const T* __restrict__ q_ptr,
     const T* __restrict__ k_ptr,
     const T* __restrict__ v_ptr,
     T* __restrict__ output_ptr,
-    const int batch_size,
-    const int num_heads,
     const int seq_len,
     const int head_dim,
     const int stride) {
+    using Acc = at::acc_type<T, true>;
+    __shared__ Acc query[256];
+    __shared__ Acc scores[256];
+    __shared__ Acc reduction[256];
 
-    // =================================================================
-    // TODO: IMPLEMENT YOUR STRIDED ATTENTION KERNEL HERE
-    // =================================================================
-    //
-    // Hints:
-    // 1. Calculate thread/block indices to figure out which output element
-    //    this thread block is responsible for.
-    //    - `blockIdx.x` can map to (batch, head).
-    //    - `blockIdx.y` can map to the query token index (`i`).
-    //    - `threadIdx.x` is the thread within the block.
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int key_count = 1 + (seq_len - 1) / stride;
+    const int64_t head_offset = static_cast<int64_t>(blockIdx.x) * seq_len * head_dim;
+    const int64_t query_offset = head_offset + static_cast<int64_t>(blockIdx.y) * head_dim;
+    const Acc scale = Acc(1) / sqrt(Acc(head_dim));
 
-    // 2. Load the query vector `q_i` for the current query token `i`.
-    //    Since all threads in the block need it, you can load it into shared memory.
+    if (tid < head_dim) {
+        query[tid] = static_cast<Acc>(q_ptr[query_offset + tid]);
+    }
+    __syncthreads();
 
-    // 3. Compute dot products `Q_i * K_j^T` for all `j` in the stride.
-    //    - Parallelize the dot product calculation across threads in the block.
-    //    - Each thread can compute a partial dot product and then you can use
-    //      a parallel reduction (e.g., using shared memory and `__syncthreads()`)
-    //      to get the final score.
+    // Only calculate scores for keys 0, stride, 2 * stride, ... .
+    for (int key = warp; key < key_count; key += 8) {
+        const int64_t key_offset = head_offset + static_cast<int64_t>(key) * stride * head_dim;
+        Acc dot = Acc(0);
+        for (int d = lane; d < head_dim; d += 32) {
+            dot += query[d] * static_cast<Acc>(k_ptr[key_offset + d]);
+        }
+        for (int offset = 16; offset > 0; offset /= 2) {
+            dot += __shfl_down_sync(0xffffffff, dot, offset);
+        }
+        if (lane == 0) {
+            scores[key] = dot * scale;
+        }
+    }
+    __syncthreads();
 
-    // 4. Compute Softmax.
-    //    - Find the maximum score among the strided scores (for numerical stability). This is another parallel reduction.
-    //    - Compute the exponential of each score (subtracting the max).
-    //    - Compute the sum of the exponentials (another parallel reduction).
-    //    - Normalize to get the final attention probabilities.
+    // Stable softmax. Inactive threads contribute -infinity to max and
+    // zero to sum, including when the number of keys is not a power of two.
+    reduction[tid] = tid < key_count ? scores[tid] : -INFINITY;
+    __syncthreads();
+    for (int offset = 128; offset > 0; offset /= 2) {
+        if (tid < offset) {
+            reduction[tid] = reduction[tid] > reduction[tid + offset]
+                ? reduction[tid] : reduction[tid + offset];
+        }
+        __syncthreads();
+    }
+    const Acc max_score = reduction[0];
+    const Acc weight = tid < key_count ? exp(scores[tid] - max_score) : Acc(0);
+    // Every thread must finish reading the maximum before reusing scratch.
+    __syncthreads();
+    reduction[tid] = weight;
+    __syncthreads();
+    for (int offset = 128; offset > 0; offset /= 2) {
+        if (tid < offset) {
+            reduction[tid] += reduction[tid + offset];
+        }
+        __syncthreads();
+    }
+    if (tid < key_count) {
+        scores[tid] = weight / (reduction[0] + Acc(1e-6));
+    }
+    __syncthreads();
 
-    // 5. Compute the weighted sum of value vectors `V_j`.
-    //    - Use the attention probabilities to weight the `v_j` vectors.
-    //    - This is another parallel dot-product-like operation. Each thread can
-    //      compute a part of the final output vector component.
-
-    // 6. Write the final output vector to `output_ptr`.
-
-    // Example of getting indices (you'll need to expand on this):
-    int batch_idx = blockIdx.x / num_heads;
-    int head_idx = blockIdx.x % num_heads;
-    int query_idx = blockIdx.y; // This is 'i' in the outer loop
-
-    // Placeholder: just copy query to output to have a compilable stub
-    long q_offset = (long)batch_idx * num_heads * seq_len * head_dim +
-                    (long)head_idx * seq_len * head_dim +
-                    (long)query_idx * head_dim;
-    
-    long output_offset = q_offset;
-    
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        output_ptr[output_offset + i] = q_ptr[q_offset + i];
+    // Each thread owns an output dimension, so value loads are coalesced.
+    if (tid < head_dim) {
+        Acc result = Acc(0);
+        for (int key = 0; key < key_count; ++key) {
+            const int64_t value_offset = head_offset + static_cast<int64_t>(key) * stride * head_dim;
+            result += scores[key] * static_cast<Acc>(v_ptr[value_offset + tid]);
+        }
+        output_ptr[query_offset + tid] = static_cast<T>(result);
     }
 }
 
-
-// C++ function that dispatches the CUDA kernel
 torch::Tensor strided_attention_forward_cuda(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v,
-    int stride) {
-
-    // Validate inputs
-    TORCH_CHECK(q.is_cuda(), "Input tensor Q must be on a CUDA device");
-    TORCH_CHECK(q.is_contiguous(), "Input tensor Q must be contiguous");
-    TORCH_CHECK(k.is_contiguous(), "Input tensor K must be contiguous");
-    TORCH_CHECK(v.is_contiguous(), "Input tensor V must be contiguous");
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, int stride) {
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Q, K, V must be CUDA tensors");
+    TORCH_CHECK(q.device() == k.device() && q.device() == v.device(), "Q, K, V must share a device");
+    TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(),
+                "Q, K, V must share a dtype");
+    TORCH_CHECK(q.dim() == 4 && q.sizes() == k.sizes() && q.sizes() == v.sizes(),
+                "Q, K, V must have matching [batch, heads, sequence, head_dim] shapes");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
+                "Q, K, V must be contiguous");
+    TORCH_CHECK(stride > 0, "stride must be positive");
 
     const auto batch_size = q.size(0);
     const auto num_heads = q.size(1);
     const auto seq_len = q.size(2);
     const auto head_dim = q.size(3);
+    TORCH_CHECK(head_dim > 0 && head_dim <= 256, "head_dim must be between 1 and 256");
+    TORCH_CHECK(seq_len <= 65535, "sequence length exceeds the CUDA grid y limit");
+    TORCH_CHECK(seq_len == 0 || 1 + (seq_len - 1) / stride <= 256,
+                "at most 256 strided keys are supported");
+    TORCH_CHECK(batch_size * num_heads <= std::numeric_limits<int>::max(),
+                "batch * heads exceeds the CUDA grid x limit");
 
-    // Create an output tensor of the same shape as Q
+    const c10::cuda::CUDAGuard device_guard(q.device());
     auto output = torch::empty_like(q);
-
-    // Define grid and block dimensions
-    // Grid: One block per (batch, head, query_token)
-    dim3 gridDim(batch_size * num_heads, seq_len);
-    // Block: Threads to parallelize the work for a single query token
-    dim3 blockDim(256);
-
-    // Dispatch the kernel based on the data type
+    if (q.numel() == 0) {
+        return output;
+    }
+    const dim3 grid(batch_size * num_heads, seq_len);
+    const auto stream = c10::cuda::getCurrentCUDAStream(q.get_device());
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "strided_attention_forward", ([&] {
-        strided_attention_forward_kernel<scalar_t><<<gridDim, blockDim>>>(
-            q.data_ptr<scalar_t>(),
-            k.data_ptr<scalar_t>(),
-            v.data_ptr<scalar_t>(),
-            output.data_ptr<scalar_t>(),
-            batch_size,
-            num_heads,
-            seq_len,
-            head_dim,
-            stride
-        );
+        strided_attention_forward_kernel<scalar_t><<<grid, 256, 0, stream.stream()>>>(
+            q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(), seq_len, head_dim, stride);
     }));
-
-    // Check for any CUDA errors
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-
     return output;
 }
 
-
-// Bind the C++ function to a Python module
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("strided_attention_forward", &strided_attention_forward_cuda, "Strided Attention Forward (CUDA)");
 }

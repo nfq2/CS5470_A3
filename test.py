@@ -10,8 +10,12 @@ CORRECTNESS_CONFIGS = [
     (2, 17, 48, 4, 3),    # seq_len not divisible by stride, head_dim not a power of 2
     (1, 64, 128, 2, 8),
     (1, 5, 16, 1, 8),     # stride > seq_len: only key 0 is attended
+    (1, 1, 1, 1, 1),      # smallest supported head and sequence
+    (1, 33, 66, 2, 1),    # multiple warp chunks and no sparsity
+    (1, 256, 256, 1, 1),  # maximum head_dim and attended-key count
 ]
 
+@torch.no_grad()
 def test_correctness(device):
     print("--- Running Correctness Test ---")
     all_passed = True
@@ -23,6 +27,7 @@ def test_correctness(device):
     else:
         print("\nCorrectness Test Failed!")
     print("-" * 30)
+    return all_passed
 
 
 def check_correctness(device, batch_size, seq_len, embed_dim, num_heads, stride):
@@ -49,10 +54,6 @@ def check_correctness(device, batch_size, seq_len, embed_dim, num_heads, stride)
     
     # 2. Run the custom CUDA kernel implementation
     print("Running custom CUDA implementation...")
-    custom_attn = CustomStridedAttention(embed_dim, num_heads, stride).to(device).double()
-    # Manually set the weights to be the same as the model's projection layer
-    custom_attn.qkv_proj.weight.data = model.layer.attention.qkv_proj.weight.data.clone()
-    custom_attn.qkv_proj.bias.data = model.layer.attention.qkv_proj.bias.data.clone()
     
     # We need to get the output from just the attention calculation, not the final projection
     # So we call the kernel directly via the binding
@@ -67,7 +68,15 @@ def check_correctness(device, batch_size, seq_len, embed_dim, num_heads, stride)
         print("Passed")
     else:
         print("Failed! Max difference:", (naive_output - custom_output).abs().max().item())
-    return is_close
+    # Also exercise reshaping, contiguous copies, and the output projection.
+    expected = naive_output.permute(0, 2, 1, 3).contiguous()
+    expected = model.layer.attention.out_proj(expected.reshape(batch_size, seq_len, embed_dim))
+    actual = model.layer.attention(x)
+    integration_close = torch.allclose(expected, actual, rtol=1e-5, atol=1e-6)
+    print("Attention layer integration:", "Passed" if integration_close else "Failed")
+    if not integration_close:
+        print("Max integration difference:", (expected - actual).abs().max().item())
+    return is_close and integration_close
 
 
 def test_benchmark(device):
@@ -149,6 +158,6 @@ if __name__ == "__main__":
     device = torch.device("cuda")
     
     if args.mode == "correctness":
-        test_correctness(device)
+        raise SystemExit(0 if test_correctness(device) else 1)
     elif args.mode == "benchmark":
         test_benchmark(device)
